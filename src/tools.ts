@@ -1132,17 +1132,23 @@ const catalogue: ToolDef[] = [
   {
     name: "screenshot",
     description:
-      "Capture the 3D preview as an image. Pass `view` to aim the camera in one step (model-relative: 'front' looks at its FACE, 'back', 'left'/'right' = the side its left/right arm is on, 'front_right', 'top'). Every capture is stamped with what it shows and WHICH EDGE OF THE IMAGE is the model's own right — a front view is mirrored, so its right hand appears on the image's left. Read that stamp instead of guessing sides. A screenshot is for YOUR iteration; it is not verification — use request_review for that.",
+      "Capture the 3D preview as an image. Pass `view` to aim the camera in one step (model-relative: 'front' looks at its FACE, 'back', 'left'/'right' = the side its left/right arm is on, 'front_right', 'top'). Every capture is stamped with what it shows and WHICH EDGE OF THE IMAGE is the model's own right — a front view is mirrored, so its right hand appears on the image's left. Read that stamp instead of guessing sides. A screenshot is for YOUR iteration; it is not verification — use request_review for that. Pass `save_to` to ALSO write the PNG to disk (a directory, a .png file, or a path with {view}); execute_script has no filesystem access, so this is the way to keep an image.",
     inputSchema: obj({
       view: { type: "string", description: "Model-relative view to aim at first. Omit to use the current camera." },
       width: { type: "number" },
       height: { type: "number" },
       annotate: { type: "boolean", description: "Stamp the view/side labels onto the image (default true)." },
+      save_to: { type: "string", description: "Also write the PNG here: a directory, a .png path, or a template with {view}." },
     }),
     handler: async (args) => {
       const res: any = await callBlockbench("screenshot", args);
       return [
-        { type: "text", text: `${res.view} — looking at ${res.looking_at}. ${res.note || ""}` },
+        {
+          type: "text",
+          text:
+            `${res.view} — looking at ${res.looking_at}. ${res.note || ""}` +
+            (res.file ? `\nSaved to: ${res.file}` : ""),
+        },
         { type: "image", data: res.base64, mimeType: "image/png" },
       ];
     },
@@ -1161,15 +1167,39 @@ const catalogue: ToolDef[] = [
       width: { type: "number" },
       height: { type: "number" },
       annotate: { type: "boolean", description: "Stamp view/side labels onto each image (default true)." },
+      save_to: { type: "string", description: "Also write each PNG here: a directory, a .png path, or a template with {view}/{index}." },
     }),
     handler: async (args) => {
       const res: any = await callBlockbench("screenshot_views", args);
+      const saved = res.saved && res.saved.length
+        ? `\nSaved: ${res.saved.map((s: any) => (s && s.path) || "(failed)").join(", ")}`
+        : "";
       return [
-        { type: "text", text: `Captured ${res.count} view(s). ${res.orientation}` },
+        { type: "text", text: `Captured ${res.count} view(s). ${res.orientation}${saved}` },
         ...shotBlocks(res.shots),
       ];
     },
   },
+
+  // ===== health / output ===================================================
+  forward(
+    "sweep_dangling",
+    "Diagnose (and with remove:true, clean up) outliner entries that have no preview mesh. ONE such entry makes Blockbench's Canvas.updateAll() throw 'Cannot read properties of undefined', which silently breaks every tool that edits the model. Run this with remove:true if several tools start failing with that TypeError, or after a script that was interrupted mid-way. Read-only by default.",
+    obj({
+      remove: { type: "boolean", description: "Actually delete the dangling entries (default false = report only)." },
+    }),
+  ),
+  forward(
+    "save_image",
+    "Render views to PNG files on disk. Same images screenshot_views returns, but written to `path` — a directory (one file per view), a .png file, or a template containing {view} and {index}. Use this to keep, diff or hand over renders; execute_script has no filesystem access, so this is the supported way to get image files out of Blockbench. Returns the absolute paths written.",
+    obj({
+      path: { type: "string", description: "Directory, .png file, or a path template with {view}/{index}. Absolute." },
+      views: { type: "array", items: {}, description: "View names to render. Defaults to front_right/front/back." },
+      width: { type: "number" },
+      height: { type: "number" },
+      annotate: { type: "boolean", description: "Stamp view/side labels (default true)." },
+    }),
+  ),
 
   // ===== plugins ===========================================================
   forward(

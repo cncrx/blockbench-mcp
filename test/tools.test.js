@@ -294,3 +294,27 @@ test("coerceArgs wraps a single value where a list is expected, and leaves the r
   // Unknown keys pass through untouched rather than being dropped.
   assert.equal(coerceArgs(byName("get_status").inputSchema, { odd: 1 }).odd, 1);
 });
+
+// --- output + health tools -------------------------------------------------
+test("save_image writes renders to disk and says where", () => {
+  const t = tools.find((x) => x.name === "save_image");
+  assert.ok(t, "save_image is registered");
+  assert.match(t.description, /path/, "documents the destination argument");
+  assert.ok(t.inputSchema.properties.path, "path is required");
+  assert.match(t.description, /execute_script/, "explains why this exists");
+});
+
+test("sweep_dangling is read-only unless asked, and names the failure it fixes", () => {
+  const t = tools.find((x) => x.name === "sweep_dangling");
+  assert.ok(t, "sweep_dangling is registered");
+  assert.equal(t.inputSchema.properties.remove.type, "boolean");
+  assert.match(t.description, /remove:true/, "documents the destructive mode");
+  assert.match(t.description, /Canvas\.updateAll/, "names the symptom it repairs");
+});
+
+test("screenshot tools can save to disk", () => {
+  for (const name of ["screenshot", "screenshot_views"]) {
+    const t = tools.find((x) => x.name === name);
+    assert.ok(t && t.inputSchema.properties.save_to, `${name} exposes save_to`);
+  }
+});

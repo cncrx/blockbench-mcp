@@ -74,6 +74,88 @@ function requireApp() {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Preview refresh
+//
+// Why this exists: Canvas.updateAll() expands to
+//   updateView({elements: Outliner.elements, groups: Group.all, selection: true})
+// and updateView walks that list calling updateTransform, which reads `.position`
+// off every entry. ONE dangling entry — a Cube/Mesh whose 3D object was never
+// built (a `new Mesh()` that was never init()'d) or was removed out from under
+// the outliner — and the walk throws "Cannot read properties of undefined
+// (reading 'position')". Because nearly every mutating tool in this file ends
+// with Canvas.updateAll(), that single bad entry turns every one of them into a
+// no-op that reports a TypeError pointing at Blockbench internals.
+//
+// So: try the real refresh, and on failure fall back to refreshing each
+// element individually, which needs no outliner walk. The dangling entry is
+// still reported once; `sweep_dangling` removes it for real.
+// ---------------------------------------------------------------------------
+function refreshAll() {
+	try {
+		refreshAll();
+		return 'canvas';
+	} catch (e) {
+		if (!refreshAll._warned) {
+			refreshAll._warned = true;
+			console.warn(
+				'[BlockbenchMCP] Canvas.updateAll() failed (' + e.message +
+				'). Falling back to a per-element refresh. This usually means one ' +
+				'dangling outliner entry (an element with no preview mesh) — run the ' +
+				'sweep_dangling tool to remove it.', e
+			);
+		}
+	}
+	let n = 0;
+	try {
+		const one = (el) => {
+			if (el && el.mesh && el.preview_controller) { el.preview_controller.updateAll(el); n++; }
+		};
+		Cube.all.forEach(one);
+		Group.all.forEach(one);
+		if (typeof Mesh !== 'undefined' && Array.isArray(Mesh.all)) Mesh.all.forEach(one);
+	} catch (e2) {
+		// A refresh must never be the thing that breaks a tool.
+		console.warn('[BlockbenchMCP] per-element refresh also failed:', e2);
+	}
+	return 'fallback:' + n;
+}
+
+/**
+ * Find outliner entries that have no preview mesh — the objects that make
+ * Canvas.updateAll() throw. Reports first, removes only when asked.
+ */
+function findDangling() {
+	const bad = [];
+	const els = (typeof Outliner !== 'undefined' && Array.isArray(Outliner.elements)) ? Outliner.elements : [];
+	for (const el of els) {
+		if (!el) { bad.push({ uuid: null, name: '(null entry)', type: 'null', issue: 'null in Outliner.elements' }); continue; }
+		if (!el.mesh) bad.push({ uuid: el.uuid, name: el.name || '?', type: el.type, issue: 'no preview mesh' });
+	}
+	return bad;
+}
+
+/** Does Canvas.updateAll() work right now? Cheap diagnostic for the health tools. */
+function testCanvasUpdateAll() {
+	try { Canvas.updateAll(); return 'ok'; }
+	catch (e) { return 'broken: ' + e.message; }
+}
+
+/** Remove dangling outliner entries. Returns what was removed. */
+function sweepDangling() {
+	const bad = findDangling();
+	const removed = [];
+	for (const rec of bad) {
+		if (!rec.uuid) continue;
+		const el = Outliner.elements.find((x) => x && x.uuid === rec.uuid);
+		if (!el) continue;
+		try { el.remove(); removed.push({ name: rec.name, type: rec.type }); }
+		catch (e) { /* already gone or not removable */ }
+	}
+	refreshAll();
+	return { dangling: bad, removed };
+}
+
 /** Resolve a Format from an id, a name, or a fuzzy match. */
 function resolveFormat(id) {
 	if (!id) return null;
@@ -3174,6 +3256,12 @@ async function captureViews(views, options) {
 	if (options && options.height) opts.height = options.height;
 	const annotate = !options || options.annotate !== false;
 	const shotOne = () => new Promise((res) => Screencam.screenshotPreview(preview, opts, (d) => res(d)));
+	// `save_to` writes each captured PNG to disk IN ADDITION to returning it. An
+	// agent iterating on a model needs the bytes on the filesystem anyway (to
+	// keep them, diff them, hand them over), and execute_script deliberately has
+	// no `require`, so this is the supported way to get a file out.
+	const saveTo = options && options.save_to;
+	const saved = [];
 	const shots = [];
 	for (const v of views) {
 		let info;
@@ -3211,6 +3299,16 @@ async function captureViews(views, options) {
 		preview.render();
 		let dataUrl = await shotOne();
 		if (annotate) dataUrl = await annotateShot(dataUrl, info, options && options.stamp);
+		let file = null;
+		if (saveTo) {
+			try {
+				file = writeShotFile(saveTo, info.view, shots.length, dataUrl);
+				saved.push(file);
+			} catch (e) {
+				file = { path: null, error: e.message };
+				saved.push(file);
+			}
+		}
 		shots.push({
 			view: info.view,
 			looking_at: info.looking_at,
@@ -3218,9 +3316,35 @@ async function captureViews(views, options) {
 			note: info.note,
 			data_url: dataUrl,
 			base64: dataUrl.replace(/^data:image\/png;base64,/, ''),
+			file: file ? file.path : null,
 		});
 	}
-	return shots;
+	return saved.length ? Object.assign(shots.length === 1 ? shots[0] : { shots, count: shots.length }, { saved }) : shots;
+}
+
+/**
+ * Turn `save_to` into an absolute PNG path and write the data URL there.
+ * `save_to` may be a directory, a .png file (used for the first/only view), or a
+ * template containing {view} / {index} / {n}.
+ */
+function writeShotFile(saveTo, viewName, index, dataUrl) {
+	const path = require('path');
+	const fs = require('fs');
+	let out = String(saveTo);
+	const safe = String(viewName || 'view').replace(/[^a-z0-9._-]+/gi, '_');
+	if (!/\.png$/i.test(out) || out.includes('{')) {
+		const name = out.includes('{view}')
+			? out.replace(/\{view\}/g, safe)
+			: out.replace(/\{view\}/g, safe).replace(/\{(?:index|n)\}/g, String(index + 1));
+		out = out.includes('{view}') || out.includes('{index}') || out.includes('{n}')
+			? path.resolve(name)
+			: path.resolve(out, (out.endsWith('/') || out.endsWith(path.sep) ? '' : path.sep) + safe + '.png');
+	} else {
+		out = path.resolve(out);
+	}
+	fs.mkdirSync(path.dirname(out), { recursive: true });
+	fs.writeFileSync(out, Buffer.from(String(dataUrl).replace(/^data:image\/png;base64,/, ''), 'base64'));
+	return { path: out, bytes: fs.statSync(out).size };
 }
 
 const DEFAULT_VIEWS = ['front_right', 'front', 'left', 'back'];
@@ -3711,7 +3835,7 @@ const commands = {
 		}
 		if (p.texture_width) Project.texture_width = p.texture_width | 0;
 		if (p.texture_height) Project.texture_height = p.texture_height | 0;
-		Canvas.updateAll();
+		refreshAll();
 		return commands.get_status().project;
 	},
 
@@ -3728,7 +3852,7 @@ const commands = {
 		if (p.texture_width) Project.texture_width = p.texture_width | 0;
 		if (p.texture_height) Project.texture_height = p.texture_height | 0;
 		updateProjectResolution && updateProjectResolution();
-		Canvas.updateAll();
+		refreshAll();
 		return commands.get_status().project;
 	},
 
@@ -3801,7 +3925,7 @@ const commands = {
 		// Codecs.project.load(model, file) sets up a fresh project from a .bbmodel
 		// (the older .parse signature is what previously failed).
 		Codecs.project.load(data, { path: p.path, content, name: p.path.split(/[\\/]/).pop() });
-		Canvas.updateAll();
+		refreshAll();
 		return commands.get_status().project;
 	},
 
@@ -3821,7 +3945,7 @@ const commands = {
 		}).init();
 		group.addTo(parent || 'root');
 		Undo.finishEdit('MCP: add group');
-		Canvas.updateAll();
+		refreshAll();
 		const out = serializeGroup(group);
 		const w = sideWarning(group);
 		if (w) out.warning = w;
@@ -3853,7 +3977,7 @@ const commands = {
 		if (p.faces) applyFaces(cube, p.faces);
 		else if (Texture.all.length) cube.applyTexture(Texture.getDefault(), true);
 		Undo.finishEdit('MCP: add cube');
-		Canvas.updateAll();
+		refreshAll();
 		return serializeElement(cube);
 	},
 
@@ -3890,7 +4014,7 @@ const commands = {
 			if (w) warnings.push(w);
 		}
 		Undo.finishEdit('MCP: add groups');
-		Canvas.updateAll();
+		refreshAll();
 		const res = { created: out.length, groups: out };
 		if (warnings.length) res.warnings = warnings;
 		return res;
@@ -3931,7 +4055,7 @@ const commands = {
 			out.push(serializeElement(cube));
 		}
 		Undo.finishEdit('MCP: add cubes');
-		Canvas.updateAll();
+		refreshAll();
 		return { created: out.length, cubes: out };
 	},
 
@@ -4052,7 +4176,7 @@ const commands = {
 		Undo.initEdit({ outliner: true, elements: [] });
 		const cubes = specs.map((s) => createCubeIn(parent, s));
 		Undo.finishEdit('MCP: voxelize matrix');
-		Canvas.updateAll();
+		refreshAll();
 
 		const res = generatedReport(cubes, {
 			plane: planeKey,
@@ -4152,7 +4276,7 @@ const commands = {
 			name: `${name}_${dir}`, from: f, to: tt, inflate: numOr(p.inflate, 0),
 		}));
 		Undo.finishEdit('MCP: add hollow volume');
-		Canvas.updateAll();
+		refreshAll();
 
 		const cavity = {
 			from: [R3(lo[0] + (has.west ? tX : 0)), R3(yLo), R3(zLo)],
@@ -4341,7 +4465,7 @@ const commands = {
 		Undo.initEdit({ outliner: true, elements: [] });
 		const cubes = specs.map((s) => createCubeIn(parent, s));
 		Undo.finishEdit('MCP: generate array');
-		Canvas.updateAll();
+		refreshAll();
 
 		const res = generatedReport(cubes, {
 			mode, distribution, anchor,
@@ -4475,7 +4599,7 @@ const commands = {
 			}
 		}
 		Undo.finishEdit('MCP: extrude chain');
-		Canvas.updateAll();
+		refreshAll();
 
 		const res = generatedReport(cubes, {
 			segments,
@@ -4731,7 +4855,7 @@ const commands = {
 			}
 		});
 		Undo.finishEdit('MCP: add wing');
-		Canvas.updateAll();
+		refreshAll();
 
 		const res = generatedReport(cubes, {
 			side, plane, membrane: mode,
@@ -5010,7 +5134,7 @@ const commands = {
 			updateProjectResolution && updateProjectResolution();
 		}
 		Undo.finishEdit('MCP: pack UV');
-		Canvas.updateAll();
+		refreshAll();
 		return { packed: res.packed, used: res.used, texture_size: [Project.texture_width, Project.texture_height] };
 	},
 
@@ -5068,7 +5192,7 @@ const commands = {
 			made.push(c2);
 		}
 		Undo.finishEdit('MCP: add plane');
-		Canvas.updateAll();
+		refreshAll();
 		return { created: made.length, planes: made.map(serializeElement) };
 	},
 
@@ -5104,7 +5228,7 @@ const commands = {
 		});
 		mesh.init().addTo(parent || 'root');
 		Undo.finishEdit('MCP: add mesh');
-		Canvas.updateAll();
+		refreshAll();
 		return { uuid: mesh.uuid, name: mesh.name, type: 'mesh', shape, vertices: Object.keys(mesh.vertices).length, faces: Object.keys(mesh.faces).length };
 	},
 
@@ -5146,7 +5270,7 @@ const commands = {
 			}
 		});
 		Undo.finishEdit('MCP: mirror');
-		Canvas.updateAll();
+		refreshAll();
 		return { created: out.length, elements: out };
 	},
 
@@ -5171,7 +5295,7 @@ const commands = {
 			el.addTo(parent);
 		}
 		Undo.finishEdit('MCP: edit element');
-		Canvas.updateAll();
+		refreshAll();
 		return isGroup ? serializeGroup(el) : serializeElement(el);
 	},
 
@@ -5182,7 +5306,7 @@ const commands = {
 		Undo.initEdit({ outliner: true, elements: el instanceof Group ? [] : [el] });
 		el.remove(false);
 		Undo.finishEdit('MCP: delete element');
-		Canvas.updateAll();
+		refreshAll();
 		return { deleted: true };
 	},
 
@@ -5290,7 +5414,7 @@ const commands = {
 			}
 		}
 		Undo.finishEdit('MCP: set UV');
-		Canvas.updateAll();
+		refreshAll();
 		return serializeElement(cube);
 	},
 
@@ -5309,7 +5433,7 @@ const commands = {
 		Undo.initEdit({ elements: targets });
 		targets.forEach((el) => el.applyTexture && el.applyTexture(tex, true));
 		Undo.finishEdit('MCP: apply texture');
-		Canvas.updateAll();
+		refreshAll();
 		return { applied_to: targets.length };
 	},
 
@@ -5374,7 +5498,7 @@ const commands = {
 		try { tex.updateMaterial && tex.updateMaterial(); } catch (e) {}
 		if (frames > 1) { try { TextureAnimator.start(); } catch (e) {} }
 		Undo.finishEdit('MCP: create vfx texture');
-		Canvas.updateAll && Canvas.updateAll();
+		Canvas.updateAll && refreshAll();
 		return Object.assign(serializeTexture(tex), { style, frames, palette });
 	},
 
@@ -5395,7 +5519,7 @@ const commands = {
 		if (p.particle === true) tex.enableParticle();
 		try { tex.updateMaterial && tex.updateMaterial(); } catch (e) {}
 		if (p.animate) { try { TextureAnimator.start(); } catch (e) {} }
-		Canvas.updateAll && Canvas.updateAll();
+		Canvas.updateAll && refreshAll();
 		return serializeTexture(tex);
 	},
 
@@ -5540,7 +5664,7 @@ const commands = {
 			});
 		}, { edit_name: 'MCP: detail cubes (smooth)', no_undo: false });
 
-		Canvas.updateAll();
+		refreshAll();
 		return { textured: cubes.length, faces: jobs.length, smooth: true, texture: serializeTexture(tex) };
 	},
 
@@ -5585,7 +5709,7 @@ const commands = {
 				}
 			}, { edit_name: 'MCP: paint faces', no_undo: false });
 		});
-		Canvas.updateAll();
+		refreshAll();
 		return { painted };
 	},
 
@@ -5759,7 +5883,7 @@ const commands = {
 			});
 		}
 		Undo.finishEdit('MCP: create rig');
-		Canvas.updateAll();
+		refreshAll();
 
 		const o = orientation();
 		return {
@@ -6131,6 +6255,7 @@ const commands = {
 	async screenshot(p) {
 		requireProject();
 		p = p || {};
+		if (p.save_to) requireApp();
 		if (p.view) {
 			const shots = await captureViews([p.view], p);
 			return Object.assign({ mime: 'image/png' }, shots[0]);
@@ -6149,6 +6274,11 @@ const commands = {
 		if (p.height) options.height = p.height;
 		let dataUrl = await new Promise((resolve) => Screencam.screenshotPreview(preview, options, resolve));
 		if (p.annotate !== false) dataUrl = await annotateShot(dataUrl, info, p.stamp);
+		let file = null;
+		if (p.save_to) {
+			try { file = writeShotFile(p.save_to, info.view, 0, dataUrl).path; }
+			catch (e) { file = null; }
+		}
 		return {
 			mime: 'image/png',
 			view: info.view,
@@ -6156,6 +6286,7 @@ const commands = {
 			model_right_on: info.model_right_on,
 			note: info.note,
 			data_url: dataUrl,
+			file: file,
 			base64: dataUrl.replace(/^data:image\/png;base64,/, ''),
 		};
 	},
@@ -6663,6 +6794,57 @@ const commands = {
 		if (!plugin || !plugin.installed) throw new Error('Plugin not installed: ' + p.id);
 		plugin.uninstall();
 		return { uninstalled: true, id: p.id };
+	},
+
+	// ---- health ------------------------------------------------------------
+	/**
+	 * Report (and optionally remove) outliner entries that have no preview mesh.
+	 * These are the objects that make Canvas.updateAll() throw, which in turn
+	 * breaks every mutating tool, so this doubles as a repair action.
+	 */
+	sweep_dangling(p) {
+		requireProject();
+		const remove = !!(p && p.remove);
+		if (!remove) {
+			const dangling = findDangling();
+			return {
+				dangling,
+				count: dangling.length,
+				canvas_update_all: testCanvasUpdateAll(),
+				hint: dangling.length
+					? 'Re-run with remove:true to delete these — each one breaks Canvas.updateAll().'
+					: 'Outliner is clean.',
+			};
+		}
+		const res = sweepDangling();
+		return {
+			removed: res.removed,
+			removed_count: res.removed.length,
+			still_dangling: findDangling().length,
+			canvas_update_all: testCanvasUpdateAll(),
+		};
+	},
+
+	/**
+	 * Render views straight to PNG files on disk. Same images screenshot_views
+	 * returns, but written to `path` (a directory, a .png file, or a template with
+	 * {view}/{index}) so an agent can keep them, diff them or pass them on without
+	 * relying on execute_script having filesystem access.
+	 */
+	async save_image(p) {
+		requireApp();
+		if (!p || !p.path) throw new Error('path is required (directory, .png file, or a {view} template)');
+		const views = Array.isArray(p.views) && p.views.length ? p.views : ['front_right', 'front', 'back'];
+		const options = { save_to: p.path, annotate: p.annotate !== false };
+		if (p.width) options.width = p.width;
+		if (p.height) options.height = p.height;
+		const shots = await captureViews(views, options);
+		const list = Array.isArray(shots) ? shots : (shots.shots || []);
+		return {
+			saved: shots.saved || list.map((s) => ({ path: s.file })).filter(Boolean),
+			count: list.length,
+			views: list.map((s) => ({ view: s.view, path: s.file })),
+		};
 	},
 
 	// ---- escape hatch -----------------------------------------------------

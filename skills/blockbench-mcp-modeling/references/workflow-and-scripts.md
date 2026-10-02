@@ -353,3 +353,55 @@ return { png:params.png, anim:params.anim };
 ```
 Pass `params:{png:'D:/.../model.png', anim:'D:/.../model.animation.json'}`. Geometry itself is
 exported with the `export_project` tool.
+
+---
+
+## 11. Traps verified on Blockbench 5.2.1
+
+These cost real debugging time; each one is a live footgun, not a style opinion.
+
+**`Undo.initEdit()` with no argument throws.** Blockbench's signature is
+`initEdit(e, t=false)` and the body dereferences `e.selection`, so a bare
+`Undo.initEdit()` dies with `Cannot read properties of undefined (reading
+'selection')`. Always pass a scope object — `Undo.initEdit({outliner:true,
+elements:[]})` for a build, `Undo.initEdit({elements:Cube.all, uv_only:true})`
+for a UV pass. The examples throughout this guide already do this; the trap is
+only hit when you write it from memory.
+
+**One dangling outliner entry breaks every tool.** `Canvas.updateAll()` expands
+to `updateView({elements: Outliner.elements, ...})`, which walks that list and
+reads `.position` off each entry. A single element with no preview mesh — a
+`new Mesh()` you never `.init()`'d, or one removed out from under the outliner —
+makes it throw `Cannot read properties of undefined (reading 'position')`. Since
+this plugin calls `Canvas.updateAll()` at the end of nearly every mutating tool,
+that one bad entry turns `add_cube`, `delete_element`, `pack_uv` and friends into
+no-ops that report a TypeError pointing nowhere useful. If several tools suddenly
+fail with that exact message, run `sweep_dangling` (it reports; pass `remove:true`
+to clean up). The plugin now falls back to a per-element refresh instead of
+failing outright, but removing the entry is the real fix.
+
+**`addTo()` takes the Group object, not a name.** `cube.addTo(Group.all.find(g =>
+g.name==='head'))`. The literal string `'root'` works because Blockbench
+special-cases it, but any other bare name throws a confusing
+`Cannot use 'in' operator ... in <name>`.
+
+**`new Cube({...})` must be `.init()`'d.** Without `.init()` the object is
+constructed but never enters `Cube.all` / `Project.elements`, so it is invisible
+to `pack_uv`, `check_model`, the outliner and the export — and it becomes exactly
+the dangling entry described above.
+
+**`free` format cubes need box_uv turned on before `pack_uv`.** In `free`,
+cubes default to `box_uv:false` with 1x1 face UVs, so `pack_uv` has nothing to
+pack and `detail_cubes` has nowhere to paint. Flip them first, per cube:
+
+```js
+Cube.all.forEach(c => { c.box_uv = true; c.uv_offset = [0,0]; c.autouv = 0;
+                        c.preview_controller.updateUV(c); });
+return { converted: Cube.all.length };
+```
+
+**Rendering a view to a file.** `execute_script` has no `require`, so it cannot
+write a render. Use `save_image` (writes PNGs to disk) or `screenshot` /
+`screenshot_views` with `save_to` — same annotated images, persisted. To write a
+PNG or JSON you already hold in memory, `Blockbench.writeFile(path, {content,
+savetype})` is available inside `execute_script` (see §10).
